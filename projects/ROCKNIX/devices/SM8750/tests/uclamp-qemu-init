@@ -1,0 +1,84 @@
+#!/usr/bin/busybox sh
+# Guest-only: rdinit used by run-uclamp-qemu.sh, with no attached disks/network.
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+set -eu
+bb() { /usr/bin/busybox "$@"; }
+finish() {
+    echo 'UCLAMP-QEMU-FAIL'
+    /usr/bin/busybox poweroff -f
+    while :; do bb sleep 10; done
+}
+trap finish EXIT
+bb mkdir -p /proc /sys /dev
+bb mount -t proc proc /proc
+bb mount -t sysfs sysfs /sys
+bb mount -t devtmpfs devtmpfs /dev
+case " $(bb cat /proc/cmdline) " in
+    *' trace_test=1 '*)
+        bb mkdir -p /sys/kernel/tracing
+        bb mount -t tracefs -o mode=0700 tracefs /sys/kernel/tracing
+        trace=/sys/kernel/tracing
+        test "$(bb cat "$trace/current_tracer")" = nop
+        test "$(bb cat "$trace/events/enable")" = 0
+        bb grep -qw function_graph "$trace/available_tracers"
+        bb grep -q '^qcom_glink:' "$trace/available_events"
+        test -f "$trace/kprobe_events"
+        test -f "$trace/uprobe_events"
+        test -f "$trace/events/raw_syscalls/sys_enter/enable"
+        echo 0 > "$trace/tracing_on"
+        echo 64 > "$trace/buffer_size_kb"
+        echo > "$trace/trace"
+        echo 1 > "$trace/events/sched/sched_switch/enable"
+        echo 1 > "$trace/tracing_on"
+        bb sleep 1
+        echo 0 > "$trace/tracing_on"
+        echo 0 > "$trace/events/sched/sched_switch/enable"
+        bb grep -q 'sched_switch:' "$trace/trace"
+        test "$(bb cat "$trace/events/enable")" = 0
+        test "$(bb cat "$trace/current_tracer")" = nop
+        echo 'TRACE-QEMU-PASS'
+        ;;
+esac
+bb mkdir -p /sys/fs/cgroup
+case " $(bb cat /proc/cmdline) " in
+    *' clamp_test=legacy '*)
+        bb mount -t cgroup -o cpu,cpuacct none /sys/fs/cgroup
+        ;;
+    *' clamp_test=unified '*)
+        bb mount -t cgroup2 none /sys/fs/cgroup
+        echo +cpu > /sys/fs/cgroup/cgroup.subtree_control
+        ;;
+    *) exit 1 ;;
+esac
+bb mkdir /sys/fs/cgroup/smoke
+group=/sys/fs/cgroup/smoke
+test -f "$group/cpu.uclamp.min"
+test -f "$group/cpu.uclamp.max"
+# Exercise the HAL's sequence on the real kernel, including removing a boost.
+for values in '20 100' '0 40' '0 25' '0 100'; do
+    set -- $values
+    echo 0 > "$group/cpu.uclamp.min"
+    echo "$2" > "$group/cpu.uclamp.max"
+    echo "$1" > "$group/cpu.uclamp.min"
+    bb grep -Eq "^$1(\.0+)?$" "$group/cpu.uclamp.min"
+    if [ "$2" = 100 ]; then
+        bb grep -Eq '^(max|100(\.0+)?)$' "$group/cpu.uclamp.max"
+    else
+        bb grep -Eq "^$2(\.0+)?$" "$group/cpu.uclamp.max"
+    fi
+done
+if (echo 101 > "$group/cpu.uclamp.max") 2>/dev/null; then
+    exit 1
+fi
+bb grep -Eq '^(max|100(\.0+)?)$' "$group/cpu.uclamp.max"
+echo $$ > "$group/cgroup.procs"
+# Descendants inherit the owned group, without per-process tuning.
+bb sleep 30 &
+child=$!
+bb grep -qx "$child" "$group/cgroup.procs"
+kill "$child"
+wait "$child" || :
+echo 'UCLAMP-QEMU-PASS'
+trap - EXIT
+bb poweroff -f
+while :; do bb sleep 10; done

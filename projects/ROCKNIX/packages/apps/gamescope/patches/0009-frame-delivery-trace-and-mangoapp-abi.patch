@@ -1,0 +1,120 @@
+From: Orbital maintainers
+Subject: [PATCH] Trace frame readiness and Wayland feedback; match MangoApp v1
+
+Opt-in markers reuse GPUVis/ftrace's bounded ring buffer. A feedback ID joins
+submit to presented/discarded; base_commit joins submit to app-ready. The host
+presentation clock is recorded explicitly, not assumed to be the app clock.
+The pinned MangoApp v1 receiver has visible timing before application timing.
+
+diff --git a/src/commit.cpp b/src/commit.cpp
+--- a/src/commit.cpp
++++ b/src/commit.cpp
+@@ -3,6 +3,10 @@
+ #include "steamcompmgr.hpp"
+ #include "commit.h"
+ 
++#include "convar.h"
++gamescope::ConVar<bool> cv_orbital_frame_trace(
++    "orbital_frame_trace", false, "Opt-in frame delivery markers in the bounded ftrace buffer." );
++
+ #include "gpuvis_trace_utils.h"
+ 
+ extern gamescope::CAsyncWaiter<gamescope::Rc<commit_t>> g_ImageWaiter;
+@@ -68,6 +72,10 @@ void commit_t::Signal()
+     uint64_t now = get_time_in_nanos();
+     present_time = now;
+ 
++    if ( cv_orbital_frame_trace )
++        gpuvis_trace_printf( "orbital_frame stage=ready pid=%u commit=%llu mono_ns=%llu desired_ns=%llu",
++            (unsigned)getpid(), (unsigned long long)commitID, (unsigned long long)now,
++            (unsigned long long)desired_present_time );
+     uint64_t frametime;
+     if ( m_bMangoNudge )
+     {
+diff --git a/src/mangoapp.cpp b/src/mangoapp.cpp
+--- a/src/mangoapp.cpp
++++ b/src/mangoapp.cpp
+@@ -21,10 +21,10 @@ struct mangoapp_msg_v1 {
+     struct mangoapp_msg_header hdr;
+ 
+     uint32_t pid;
+-    uint64_t app_frametime_ns;
++    uint64_t visible_frametime_ns;
+     uint8_t fsrUpscale;
+     uint8_t fsrSharpness;
+-    uint64_t visible_frametime_ns;
++    uint64_t app_frametime_ns;
+     uint64_t latency_ns;
+     uint32_t outputWidth;
+     uint32_t outputHeight;
+diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -10,6 +10,10 @@
+ #include "refresh_rate.h"
+ #include "waitable.h"
+ #include "Utils/TempFiles.h"
++#include "gpuvis_trace_utils.h"
++
++extern gamescope::ConVar<bool> cv_orbital_frame_trace;
++extern uint64_t g_uCurrentBasePlaneCommitID;
+ 
+ #include <cstring>
+ #include <unordered_map>
+@@ -724,6 +728,8 @@
+         xdg_wm_base *GetXDGWMBase() const { return m_pXdgWmBase; }
+         wp_viewporter *GetViewporter() const { return m_pViewporter; }
+         wp_presentation *GetPresentation() const { return m_pPresentation; }
++        uint32_t m_uPresentationClockId = UINT32_MAX;
++
+         frog_color_management_factory_v1 *GetFrogColorManagementFactory() const { return m_pFrogColorMgmtFactory; }
+         wp_color_manager_v1 *GetWPColorManager() const { return m_pWPColorManager; }
+         wp_image_description_v1 *GetWPImageDescription( GamescopeAppTextureColorspace eColorspace ) const { return m_pWPImageDescriptions[ (uint32_t)eColorspace ]; }
+@@ -1473,6 +1479,12 @@
+             {
+                 struct wp_presentation_feedback *pFeedback = wp_presentation_feedback( m_pBackend->GetPresentation(), m_pSurface );
+                 wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, this );
++                if ( cv_orbital_frame_trace )
++                    gpuvis_trace_printf( "orbital_frame stage=submit pid=%u feedback=%u base_commit=%llu mono_ns=%llu",
++                        (unsigned)getpid(), wl_proxy_get_id( (wl_proxy *)pFeedback ),
++                        (unsigned long long)g_uCurrentBasePlaneCommitID,
++                        (unsigned long long)get_time_in_nanos() );
++
+             }
+ 
+             if ( m_pWPColorManagedSurface )
+@@ -1776,4 +1788,11 @@
+                           ( uint64_t( uTVNSec ) );
+ 
++        // Host presentation time is not the callback arrival time.
++        if ( cv_orbital_frame_trace )
++            gpuvis_trace_printf( "orbital_frame stage=presented pid=%u feedback=%u host_ns=%llu host_clock=%u refresh_ns=%u sequence=%llu flags=%u callback_mono_ns=%llu",
++                (unsigned)getpid(), wl_proxy_get_id( (wl_proxy *)pFeedback ), (unsigned long long)ulTime,
++                m_pBackend->m_uPresentationClockId, uRefreshCycle,
++                (unsigned long long)((uint64_t(uSeqHi) << 32) | uSeqLo), uFlags, (unsigned long long)get_time_in_nanos() );
++
+         if ( uRefreshCycle )
+         {
+@@ -1802,5 +1821,9 @@
+     void CWaylandPlane::Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback )
+     {
++        if ( cv_orbital_frame_trace )
++            gpuvis_trace_printf( "orbital_frame stage=discarded pid=%u feedback=%u callback_mono_ns=%llu",
++                (unsigned)getpid(), wl_proxy_get_id( (wl_proxy *)pFeedback ),
++                (unsigned long long)get_time_in_nanos() );
+         wp_presentation_feedback_destroy( pFeedback );
+ 
+         // Nudge so that steamcompmgr releases commits.
+@@ -2543,6 +2566,12 @@
+         else if ( !strcmp( pInterface, wp_presentation_interface.name ) )
+         {
+             m_pPresentation = (wp_presentation *)wl_registry_bind( pRegistry, uName, &wp_presentation_interface, 1u );
++            static const wp_presentation_listener listener = {
++                .clock_id = [](void *data, wp_presentation *, uint32_t clock) {
++                    static_cast<CWaylandBackend *>(data)->m_uPresentationClockId = clock;
++                },
++            };
++            wp_presentation_add_listener( m_pPresentation, &listener, this );
+         }
+         else if ( !strcmp( pInterface, wl_output_interface.name ) )
+         {

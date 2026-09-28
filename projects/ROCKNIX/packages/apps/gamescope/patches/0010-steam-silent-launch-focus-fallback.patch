@@ -1,0 +1,52 @@
+From: Orbital maintainers
+Subject: [PATCH] Select the requested silent-launch app when Steam supplies no focus
+
+SteamControlled deliberately has no global automatic selection. A silent
+desktop Steam launch can therefore leave a ready game invisible. The launcher
+opts in with its requested app ID; use the existing picker without publishing
+an X11 focus-control property. Steam selections and existing unrelated focus
+always win. This runs only on ordinary focus changes, not a polling thread.
+
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -4090,6 +4090,9 @@
+ 
+ uint32_t g_focusedBaseAppId = 0;
+ 
++gamescope::ConVar<uint32_t> cv_orbital_steam_fallback_appid{
++	"orbital_steam_fallback_appid", 0, "Requested silent-launch app; used only without Steam focus control." };
++
+ static void
+ determine_and_apply_focus( global_focus_t *pFocus )
+ {
+@@ -4170,7 +4173,28 @@ determine_and_apply_focus( global_focus_t *pFocus )
+ 	XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFocusableWindowsAtom, XA_CARDINAL, 32, PropModeReplace,
+ 					 (unsigned char *)focusable_windows.data(), focusable_windows.size() );
+ 
+-	gameFocused = pick_primary_focus_and_override( pFocus, root_ctx->focusControlWindow, vecPossibleFocusWindows, true, vecFocuscontrolAppIDs,
++	// Keep the fallback local: a permanent root-property pin would fight Steam.
++	std::vector<uint32_t> focusControlAppIDs = vecFocuscontrolAppIDs;
++	const uint32_t requestedAppID = cv_orbital_steam_fallback_appid;
++	if ( requestedAppID && pFocus->GetNestedHints() &&
++		gamescope::cv_backend_virtual_connector_strategy == gamescope::VirtualConnectorStrategies::SteamControlled &&
++		root_ctx->focusControlWindow == None && focusControlAppIDs.empty() &&
++		( !pFocus->focusWindow || pFocus->focusWindow->appID == requestedAppID ) )
++	{
++		for ( steamcompmgr_win_t *candidate : vecPossibleFocusWindows )
++		{
++			if ( candidate->appID != requestedAppID || win_is_useless( candidate ) ||
++				win_skip_and_not_fullscreen( candidate ) || win_is_override_redirect( candidate ) ||
++				win_is_disabled( candidate ) || !window_has_commits( candidate ) )
++				continue;
++			focusControlAppIDs.push_back( requestedAppID );
++			if ( !pFocus->focusWindow )
++				focus_log.infof( "Silent-launch focus fallback: app %u", requestedAppID );
++			break;
++		}
++	}
++
++	gameFocused = pick_primary_focus_and_override( pFocus, root_ctx->focusControlWindow, vecPossibleFocusWindows, true, focusControlAppIDs,
+ 		pFocus->ulVirtualFocusKey,
+ 		gamescope::cv_backend_virtual_connector_strategy );
+ 

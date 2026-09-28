@@ -10,7 +10,7 @@ PKG_URL="${PKG_SITE}.git"
 PKG_DEPENDS_TARGET="toolchain wayland wayland-protocols libdrm libinput libxkbcommon pixman systemd \
                     libcap luajit libdecor libX11 libXext libXfixes libXdamage libXcomposite \
                     libXrender libXxf86vm libXtst libXi libXcursor libXmu libXres libxcb \
-                    xcb-util-wm seatd hwdata:host SDL2 pipewire"
+                    xcb-util-wm seatd hwdata:host SDL2 pipewire Python3"
 PKG_LONGDESC="SteamOS session compositing window manager (micro-compositor for games / nested Wayland)."
 PKG_TOOLCHAIN="meson"
 
@@ -18,7 +18,8 @@ if [ "${VULKAN_SUPPORT}" = "yes" ]; then
   PKG_DEPENDS_TARGET+=" ${VULKAN}"
 fi
 
-PKG_MESON_OPTS_TARGET="-Ddrm_backend=enabled \
+PKG_MESON_OPTS_TARGET="-Dforce_fallback_for=libliftoff,vkroots,libdisplay-info \
+                       -Ddrm_backend=enabled \
                        -Dpipewire=enabled \
                        -Denable_openvr_support=false \
                        -Davif_screenshots=disabled \
@@ -34,4 +35,9 @@ pre_configure_target() {
   # - wlroots xwm.c: return-type (control reaches end of non-void function)
   export TARGET_CFLAGS="${TARGET_CFLAGS} -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=return-type"
   export TARGET_CXXFLAGS="${TARGET_CXXFLAGS} -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=return-type"
+}
+
+post_makeinstall_target() {
+  install -Dm0755 "${PKG_DIR}/tools/frame-delivery-report.py" "${INSTALL}/usr/bin/rocknix-frame-report"
+  install -Dm0644 "${PKG_DIR}/FRAME-DELIVERY.md" "${INSTALL}/usr/share/doc/gamescope/FRAME-DELIVERY.md"
 }

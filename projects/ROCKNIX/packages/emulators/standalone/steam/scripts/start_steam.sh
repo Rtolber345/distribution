@@ -79,7 +79,7 @@ steam_debug_print() {
 steam_read_sway_geometry() {
   eval "$(swaymsg -t get_outputs | jq -r '
     .[] | select(.focused == true) |
-    "W=\(.current_mode.width) H=\(.current_mode.height) TRANSFORM=\(.transform) REFRESH=\(.current_mode.refresh // 60000)"
+    "W=\(.current_mode.width) H=\(.current_mode.height) LOGICAL_W=\(.rect.width) LOGICAL_H=\(.rect.height) TRANSFORM=\(.transform) REFRESH=\(.current_mode.refresh // 60000)"
   ')"
   # Round to nearest (119990 mHz -> 120) to match the mode's integer vrefresh,
   # which gamescope's -r must hit exactly or it falls back to the preferred mode.
@@ -136,6 +136,38 @@ steam_touch_calibration_end() {
   STEAM_TOUCH_EVENT=""
 }
 
+steam_input_target_begin() {
+  local hook="/usr/lib/autostart/quirks/devices/${QUIRK_DEVICE:-}/bin/steam-input-target"
+
+  STEAM_INPUT_TARGET_HOOK=""
+  [ -x "${hook}" ] || return 0
+  "${hook}" begin || return 1
+  STEAM_INPUT_TARGET_HOOK="${hook}"
+}
+
+steam_input_target_end() {
+  local status=0
+
+  [ -n "${STEAM_INPUT_TARGET_HOOK:-}" ] || return 0
+  "${STEAM_INPUT_TARGET_HOOK}" end
+  status=$?
+  if [ "${status}" -ne 0 ]; then
+    sleep 0.2
+    "${STEAM_INPUT_TARGET_HOOK}" end
+    status=$?
+  fi
+  [ "${status}" -ne 0 ] || STEAM_INPUT_TARGET_HOOK=""
+  return "${status}"
+}
+
+steam_session_cleanup() {
+  local status=0
+
+  steam_touch_calibration_end || status=$?
+  steam_input_target_end || status=$?
+  return "${status}"
+}
+
 steam_scope_reexec_if_needed() {
   if [ -z "$_STEAM_SCOPE" ]; then
     systemctl stop steam-bigpicture.scope 2>/dev/null || true
@@ -148,6 +180,7 @@ steam_scope_reexec_if_needed() {
       -E HOME="$HOME" \
       -E USER="$USER" \
       -E TZ="$TZ" \
+      -E ROCKNIX_STEAM_NESTED="${ROCKNIX_STEAM_NESTED:-0}" \
       -- "${STEAM_MAIN_SCRIPT}" "$@"
   fi
 }
@@ -173,9 +206,14 @@ steam_arm64_binfmt_and_proton_prep() {
 }
 
 steam_launch_bigpicture() {
-  local game_uri=""
+  local -a steam_launch_args=()
+  local fallback_app_id=0
   local force_orientation="normal"
   local gamescope_mode_file="/storage/.config/gamescope/modes.cfg"
+  local gamescope_display_args=""
+  local gamescope_env_args="-u WAYLAND_DISPLAY"
+  local mango_timing_source="output"
+  local restart_ui=1
   if [ "${TRANSFORM}" = "90" ]; then
     force_orientation="right"
   elif [ "${TRANSFORM}" = "180" ]; then
@@ -187,37 +225,75 @@ steam_launch_bigpicture() {
   if [[ "$1" == *.desktop && -f "$1" && "$(basename "$1")" != "Steam.desktop" ]]; then
     local exec_line
     exec_line=$(grep -m1 '^Exec=' "$1" | cut -d'=' -f2-)
-    game_uri="${exec_line#steam } -silent"
+    steam_launch_args=(-silent -nobigpicture "${exec_line#steam }")
+    if [[ "${ROCKNIX_STEAM_NESTED:-0}" == 1 && "${exec_line}" =~ ^steam\ steam://rungameid/([1-9][0-9]{0,9})$ ]] &&
+       (( BASH_REMATCH[1] <= 4294967295 )); then
+      fallback_app_id=${BASH_REMATCH[1]}
+    fi
   fi
 
   mkdir -p "$(dirname "$gamescope_mode_file")"
   touch "$gamescope_mode_file"
   unset MESA_LOADER_DRIVER_OVERRIDE
+  if [ "${ROCKNIX_STEAM_NESTED:-0}" = "1" ]; then
+    W=${LOGICAL_W}
+    H=${LOGICAL_H}
+    # Autodetection can select a standalone backend even when Sway's Wayland
+    # socket is present. Be explicit: Orbital must keep compositor ownership so
+    # the trusted overlay remains available above Steam and the game.
+    gamescope_display_args="--backend wayland -f"
+    gamescope_env_args=""
+    mango_timing_source="app-ready"
+    restart_ui=0
+  else
+    gamescope_display_args="--backend drm --force-orientation ${force_orientation}"
+  fi
   if [ "${STEAM_FLAVOR}" = "arm64" ]; then
     export STEAM_COMPAT_GRAPHICS_PROVIDER=//storage/.local/share/fex-emu/RootFS/ArchLinux/graphics_provider.json
-    LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} gamescope -- /storage/.local/share/Steam/steamrtarm64/steam -deckard -steamos3 -exitsteam
-    systemctl stop sway
-    steam_touch_calibration_begin "${force_orientation}"
-    trap steam_touch_calibration_end EXIT
+    LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} gamescope -- /storage/.local/share/Steam/steamrtarm64/steam -deckard -steamos3 -silent -exitsteam
+    [ "${#steam_launch_args[@]}" -ne 0 ] || steam_launch_args=(-gamepadui)
+    if ! steam_input_target_begin; then
+      echo "Steam input target setup failed" >&2
+      return 1
+    fi
+    trap steam_session_cleanup EXIT
+    if [ "${restart_ui}" -eq 1 ]; then
+      systemctl stop sway
+      steam_touch_calibration_begin "${force_orientation}"
+    fi
     GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 \
-    env -u WAYLAND_DISPLAY LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} \
-    gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" -e -- \
-    /storage/.local/share/Steam/steamrtarm64/steam -deckard -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
-    steam_touch_calibration_end
-    trap - EXIT
-    systemctl start essway
+    env ${gamescope_env_args} gamescope_orbital_steam_fallback_appid="${fallback_app_id}" \
+    MANGOAPP_TIMING_SOURCE="${mango_timing_source}" \
+    LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} \
+    gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 --mangoapp ${gamescope_display_args} -e -- \
+    /storage/.local/share/Steam/steamrtarm64/steam -deckard -steamos3 -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders "${steam_launch_args[@]}"
+    if steam_session_cleanup; then
+      trap - EXIT
+    else
+      echo "Steam input target cleanup failed" >&2
+    fi
+    [ "${restart_ui}" -eq 0 ] || systemctl start ${UI_SERVICE:-essway}
     exit 0
   else
-    FEX /usr/bin/steam -exitsteam
-    systemctl stop sway
-    steam_touch_calibration_begin "${force_orientation}"
-    trap steam_touch_calibration_end EXIT
-    GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env -u WAYLAND_DISPLAY ${EMUPERF} \
-      gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 --backend drm --force-orientation "${force_orientation}" -- \
-      FEX /usr/bin/steam -nobigpicture -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
-    steam_touch_calibration_end
-    trap - EXIT
-    systemctl start essway
+    FEX /usr/bin/steam -silent -exitsteam
+    if ! steam_input_target_begin; then
+      echo "Steam input target setup failed" >&2
+      return 1
+    fi
+    trap steam_session_cleanup EXIT
+    if [ "${restart_ui}" -eq 1 ]; then
+      systemctl stop sway
+      steam_touch_calibration_begin "${force_orientation}"
+    fi
+    GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env ${gamescope_env_args} ${EMUPERF} \
+      gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 ${gamescope_display_args} -- \
+      FEX /usr/bin/steam -nobigpicture -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders "${steam_launch_args[@]}"
+    if steam_session_cleanup; then
+      trap - EXIT
+    else
+      echo "Steam input target cleanup failed" >&2
+    fi
+    [ "${restart_ui}" -eq 0 ] || systemctl start ${UI_SERVICE:-essway}
     exit 0
   fi
 }

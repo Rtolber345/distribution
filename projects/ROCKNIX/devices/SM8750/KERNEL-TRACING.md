@@ -37,6 +37,12 @@ check Kconfig dependency resolution too. This checks capability selection, not
 runtime capture. Rebuild and qualify the kernel plus its matching modules;
 do not replace only KERNEL while retaining incompatible modules.
 
+For a diskless virtual-machine smoke test of the built kernel and embedded
+initramfs, run `TRACE_SMOKE=1 tests/run-uclamp-qemu.sh /absolute/path/to/Image
+/absolute/path/to/results` from this device directory. It checks tracing starts
+idle, records a bounded scheduler event, disables it, and exercises both cgroup
+layouts. This verifies real kernel behavior, not the Odin DSP or GPU hardware.
+
 References: [ftrace](https://docs.kernel.org/trace/ftrace.html),
 [kprobe events](https://docs.kernel.org/trace/kprobetrace.html),
 [uprobe events](https://docs.kernel.org/trace/uprobetracer.html).

@@ -1,0 +1,389 @@
+From: Orbital contributors
+Subject: [PATCH] rpmsg: contain GLINK framing faults and gate one remoteproc recovery
+
+Candidate; not deployed. Only the Odin3 ADSP DT quirk enables recovery.
+Uses the native remoteproc crash work; never skips an unknown packet.
+VERSION/start ordering adapted from Chunkai Deng's upstream proposal:
+https://lists.openwall.net/linux-kernel/2026/08/24/387
+Recovery contract: https://docs.kernel.org/staging/remoteproc.html
+
+---
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -126,6 +126,7 @@
+ 	bool sent_read_notify;
+ 
+ 	bool abort_tx;
++	unsigned long transport_fault;
+ };
+ 
+ enum {
+@@ -378,6 +379,7 @@
+ 		spin_unlock_irqrestore(&glink->tx_lock, flags);
+ 
+ 		wait_event_timeout(glink->tx_avail_notify,
++				   READ_ONCE(glink->abort_tx) ||
+ 				   qcom_glink_tx_avail(glink) >= tlen, 10 * HZ);
+ 
+ 		spin_lock_irqsave(&glink->tx_lock, flags);
+@@ -386,6 +388,10 @@
+ 			glink->sent_read_notify = false;
+ 	}
+ 
++	if (glink->abort_tx) {
++		ret = -EIO;
++		goto out;
++	}
+ 	qcom_glink_tx_write(glink, hdr, hlen, data, dlen);
+ 	qcom_glink_tx_kick(glink);
+ 
+@@ -1182,6 +1188,8 @@
+ 	wake_up_all(&glink->tx_avail_notify);
+ 
+ 	for (;;) {
++		if (test_bit(0, &glink->transport_fault))
++			break;
+ 		avail = qcom_glink_rx_avail(glink);
+ 		if (avail < sizeof(msg))
+ 			break;
+@@ -1230,7 +1238,8 @@
+ 			qcom_glink_handle_signals(glink, param1, param2);
+ 			break;
+ 		default:
+-			dev_err(glink->dev, "unhandled rx cmd: %d\n", cmd);
++			dev_err_ratelimited(glink->dev, "unhandled rx cmd: %d\n", cmd);
++			qcom_glink_native_fail(glink);
+ 			ret = -EINVAL;
+ 			break;
+ 		}
+@@ -1780,7 +1789,8 @@
+ 
+ 	for (;;) {
+ 		spin_lock_irqsave(&glink->rx_lock, flags);
+-		if (list_empty(&glink->rx_queue)) {
++		if (list_empty(&glink->rx_queue) ||
++		    test_bit(0, &glink->transport_fault)) {
+ 			spin_unlock_irqrestore(&glink->rx_lock, flags);
+ 			break;
+ 		}
+@@ -1814,7 +1824,8 @@
+ 			qcom_glink_handle_intent_req(glink, param1, param2);
+ 			break;
+ 		default:
+-			WARN(1, "Unknown defer object %d\n", cmd);
++			dev_err_ratelimited(glink->dev, "Unknown defer object %d\n", cmd);
++			qcom_glink_native_fail(glink);
+ 			break;
+ 		}
+ 
+@@ -1928,17 +1939,25 @@
+ 	if (ret)
+ 		dev_err(dev, "failed to add groups\n");
+ 
++	return glink;
++}
++EXPORT_SYMBOL_GPL(qcom_glink_native_probe);
++
++int qcom_glink_native_start(struct qcom_glink *glink)
++{
++	int ret;
++
+ 	ret = qcom_glink_send_version(glink);
+ 	if (ret)
+-		return ERR_PTR(ret);
++		return ret;
+ 
+ 	ret = qcom_glink_create_chrdev(glink);
+ 	if (ret)
+ 		dev_err(glink->dev, "failed to register chrdev\n");
+ 
+-	return glink;
++	return 0;
+ }
+-EXPORT_SYMBOL_GPL(qcom_glink_native_probe);
++EXPORT_SYMBOL_GPL(qcom_glink_native_start);
+ 
+ static int qcom_glink_remove_device(struct device *dev, void *data)
+ {
+@@ -1947,18 +1966,15 @@
+ 	return 0;
+ }
+ 
+-void qcom_glink_native_remove(struct qcom_glink *glink)
++static void qcom_glink_abort_senders(struct qcom_glink *glink)
+ {
+ 	struct glink_channel *channel;
+ 	unsigned long flags;
+ 	int cid;
+-	int ret;
+-
+-	qcom_glink_cancel_rx_work(glink);
+ 
+ 	/* Fail all attempts at sending messages */
+ 	spin_lock_irqsave(&glink->tx_lock, flags);
+-	glink->abort_tx = true;
++	WRITE_ONCE(glink->abort_tx, true);
+ 	wake_up_all(&glink->tx_avail_notify);
+ 	spin_unlock_irqrestore(&glink->tx_lock, flags);
+ 
+@@ -1967,6 +1983,26 @@
+ 	idr_for_each_entry(&glink->lcids, channel, cid)
+ 		qcom_glink_intent_req_abort(channel);
+ 	spin_unlock_irqrestore(&glink->idr_lock, flags);
++}
++
++void qcom_glink_native_fail(struct qcom_glink *glink)
++{
++	if (!glink->rx_pipe->fault ||
++	    test_and_set_bit(0, &glink->transport_fault))
++		return;
++	qcom_glink_abort_senders(glink);
++	glink->rx_pipe->fault(glink->rx_pipe);
++}
++EXPORT_SYMBOL_GPL(qcom_glink_native_fail);
++
++void qcom_glink_native_remove(struct qcom_glink *glink)
++{
++	struct glink_channel *channel;
++	int cid, ret;
++
++	/* The RX worker may itself be waiting for transmit space. */
++	qcom_glink_abort_senders(glink);
++	qcom_glink_cancel_rx_work(glink);
+ 
+ 	ret = device_for_each_child(glink->dev, NULL, qcom_glink_remove_device);
+ 	if (ret)
+diff --git a/drivers/rpmsg/qcom_glink_native.h b/drivers/rpmsg/qcom_glink_native.h
+--- a/drivers/rpmsg/qcom_glink_native.h
++++ b/drivers/rpmsg/qcom_glink_native.h
+@@ -25,6 +25,7 @@
+ 		      const void *hdr, size_t hlen,
+ 		      const void *data, size_t dlen);
+ 	void (*kick)(struct qcom_glink_pipe *glink_pipe);
++	void (*fault)(struct qcom_glink_pipe *glink_pipe);
+ };
+ 
+ struct device;
+@@ -37,5 +38,7 @@
+ 					   bool intentless);
+ void qcom_glink_native_remove(struct qcom_glink *glink);
+ void qcom_glink_native_rx(struct qcom_glink *glink);
++void qcom_glink_native_fail(struct qcom_glink *glink);
++int qcom_glink_native_start(struct qcom_glink *glink);
+ 
+ #endif
+diff --git a/drivers/rpmsg/qcom_glink_smem.c b/drivers/rpmsg/qcom_glink_smem.c
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -45,6 +45,8 @@
+ 	struct mbox_chan *mbox_chan;
+ 
+ 	u32 remote_pid;
++	void (*fault)(void *);
++	void *fault_data;
+ };
+ 
+ struct glink_smem_pipe {
+@@ -82,8 +84,20 @@
+ 		pipe->native.length = len;
+ 	}
+ 
+-	head = le32_to_cpu(*pipe->head);
+-	tail = le32_to_cpu(*pipe->tail);
++	head = le32_to_cpu(READ_ONCE(*pipe->head));
++	tail = le32_to_cpu(READ_ONCE(*pipe->tail));
++	if (smem->fault && (head >= pipe->native.length ||
++			   tail >= pipe->native.length ||
++			   !IS_ALIGNED(head, FIFO_ALIGNMENT) ||
++			   !IS_ALIGNED(tail, FIFO_ALIGNMENT))) {
++		dev_err_ratelimited(&smem->dev,
++			"invalid RX indices head=%u tail=%u length=%zu\n",
++			head, tail, pipe->native.length);
++		qcom_glink_native_fail(smem->glink);
++		return 0;
++	}
++	/* Observe the producer's data after its published head. */
++	rmb();
+ 
+ 	if (head < tail)
+ 		return pipe->native.length - tail + head;
+@@ -123,7 +137,9 @@
+ 	if (tail >= pipe->native.length)
+ 		tail -= pipe->native.length;
+ 
+-	*pipe->tail = cpu_to_le32(tail);
++	/* Finish reading before allowing the remote to reuse these bytes. */
++	mb();
++	WRITE_ONCE(*pipe->tail, cpu_to_le32(tail));
+ }
+ 
+ static size_t glink_smem_tx_avail(struct qcom_glink_pipe *np)
+@@ -201,6 +217,13 @@
+ 	mbox_client_txdone(smem->mbox_chan, 0);
+ }
+ 
++static void glink_smem_fault(struct qcom_glink_pipe *np)
++{
++	struct qcom_glink_smem *smem = to_smem_pipe(np)->smem;
++
++	smem->fault(smem->fault_data);
++}
++
+ static irqreturn_t qcom_glink_smem_intr(int irq, void *data)
+ {
+ 	struct qcom_glink_smem *smem = data;
+@@ -218,7 +241,8 @@
+ }
+ 
+ struct qcom_glink_smem *qcom_glink_smem_register(struct device *parent,
+-						 struct device_node *node)
++						 struct device_node *node,
++						 void (*fault)(void *), void *data)
+ {
+ 	struct glink_smem_pipe *rx_pipe;
+ 	struct glink_smem_pipe *tx_pipe;
+@@ -255,6 +279,8 @@
+ 	}
+ 
+ 	smem->remote_pid = remote_pid;
++	smem->fault = fault;
++	smem->fault_data = data;
+ 
+ 	rx_pipe = devm_kzalloc(dev, sizeof(*rx_pipe), GFP_KERNEL);
+ 	tx_pipe = devm_kzalloc(dev, sizeof(*tx_pipe), GFP_KERNEL);
+@@ -326,6 +352,7 @@
+ 	rx_pipe->native.avail = glink_smem_rx_avail;
+ 	rx_pipe->native.peek = glink_smem_rx_peek;
+ 	rx_pipe->native.advance = glink_smem_rx_advance;
++	rx_pipe->native.fault = fault ? glink_smem_fault : NULL;
+ 
+ 	tx_pipe->smem = smem;
+ 	tx_pipe->native.avail = glink_smem_tx_avail;
+@@ -348,6 +375,13 @@
+ 
+ 	enable_irq(smem->irq);
+ 
++	ret = qcom_glink_native_start(glink);
++	if (ret) {
++		disable_irq(smem->irq);
++		qcom_glink_native_remove(glink);
++		goto err_free_mbox;
++	}
++
+ 	return smem;
+ 
+ err_free_mbox:
+diff --git a/drivers/rpmsg/qcom_glink_rpm.c b/drivers/rpmsg/qcom_glink_rpm.c
+--- a/drivers/rpmsg/qcom_glink_rpm.c
++++ b/drivers/rpmsg/qcom_glink_rpm.c
+@@ -358,6 +358,14 @@
+ 
+ 	enable_irq(rpm->irq);
+ 
++	ret = qcom_glink_native_start(glink);
++	if (ret) {
++		disable_irq(rpm->irq);
++		qcom_glink_native_remove(glink);
++		mbox_free_channel(rpm->mbox_chan);
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/remoteproc/qcom_common.c b/drivers/remoteproc/qcom_common.c
+--- a/drivers/remoteproc/qcom_common.c
++++ b/drivers/remoteproc/qcom_common.c
+@@ -213,11 +213,26 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_minidump);
+ 
++static void glink_transport_fault(void *data)
++{
++	struct qcom_rproc_glink *glink = data;
++	struct rproc *rproc = container_of(glink->dev, struct rproc, dev);
++
++	/* This budget outlives the transport edge recreated by recovery. */
++	if (test_and_set_bit(0, &glink->transport_recovered)) {
++		dev_err(glink->dev, "GLINK recovery exhausted; transport offline\n");
++		return;
++	}
++	rproc_report_crash(rproc, RPROC_FATAL_ERROR);
++}
++
+ static int glink_subdev_start(struct rproc_subdev *subdev)
+ {
+ 	struct qcom_rproc_glink *glink = to_glink_subdev(subdev);
+ 
+-	glink->edge = qcom_glink_smem_register(glink->dev, glink->node);
++	glink->edge = qcom_glink_smem_register(glink->dev, glink->node,
++		of_property_read_bool(glink->node, "rocknix,recover-glink-transport") ?
++		glink_transport_fault : NULL, glink);
+ 
+ 	return PTR_ERR_OR_ZERO(glink->edge);
+ }
+diff --git a/drivers/remoteproc/qcom_common.h b/drivers/remoteproc/qcom_common.h
+--- a/drivers/remoteproc/qcom_common.h
++++ b/drivers/remoteproc/qcom_common.h
+@@ -17,6 +17,7 @@
+ 	struct device *dev;
+ 	struct device_node *node;
+ 	struct qcom_glink_smem *edge;
++	unsigned long transport_recovered;
+ };
+ 
+ struct qcom_rproc_subdev {
+diff --git a/include/linux/rpmsg/qcom_glink.h b/include/linux/rpmsg/qcom_glink.h
+--- a/include/linux/rpmsg/qcom_glink.h
++++ b/include/linux/rpmsg/qcom_glink.h
+@@ -16,14 +16,16 @@
+ #if IS_ENABLED(CONFIG_RPMSG_QCOM_GLINK_SMEM)
+ 
+ struct qcom_glink_smem *qcom_glink_smem_register(struct device *parent,
+-						 struct device_node *node);
++						 struct device_node *node,
++						 void (*fault)(void *), void *data);
+ void qcom_glink_smem_unregister(struct qcom_glink_smem *glink);
+ 
+ #else
+ 
+ static inline struct qcom_glink_smem *
+ qcom_glink_smem_register(struct device *parent,
+-			 struct device_node *node)
++			 struct device_node *node,
++			 void (*fault)(void *), void *data)
+ {
+ 	return NULL;
+ }
+diff --git a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-odin3.dts
+@@ -242,6 +242,10 @@
+ 			"qcom/sm8750/ayn/odin3/adsp_dtb.mbn";
+ 
+ 	status = "okay";
++
++	glink-edge {
++		rocknix,recover-glink-transport;
++	};
+ };
+ 
+ &remoteproc_cdsp {
+diff --git a/Documentation/devicetree/bindings/remoteproc/qcom,glink-edge.yaml b/Documentation/devicetree/bindings/remoteproc/qcom,glink-edge.yaml
+--- a/Documentation/devicetree/bindings/remoteproc/qcom,glink-edge.yaml
++++ b/Documentation/devicetree/bindings/remoteproc/qcom,glink-edge.yaml
+@@ -14,6 +14,12 @@
+   related to the remote processor.
+ 
+ properties:
++  rocknix,recover-glink-transport:
++    type: boolean
++    description:
++      Downstream opt-in for one remoteproc recovery attempt per driver lifetime
++      after a GLINK framing fault. Subsequent faults leave the edge offline.
++
+   apr:
+     $ref: /schemas/soc/qcom/qcom,apr.yaml#
+     required:
